@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
 	chunks_ref  INTEGER NOT NULL DEFAULT 0,
 	created_at  TEXT    NOT NULL,
 	committed_at TEXT,
-	message     TEXT    NOT NULL DEFAULT ''
+	message     TEXT    NOT NULL DEFAULT '',
+	policy_id       INTEGER,             -- set when scanned under a scan policy
+	policy_revision INTEGER              -- published revision number, frozen at scan start
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -127,7 +129,48 @@ func (m *Manifest) migrate() error {
 	if err != nil {
 		return fmt.Errorf("migrate manifest: %w", err)
 	}
+	if _, err := m.db.Exec(policySchemaSQL); err != nil {
+		return fmt.Errorf("migrate policy schema: %w", err)
+	}
+	// Columns added after the first schema version: ALTER for databases
+	// created before scan policies existed.
+	for _, col := range []struct{ name, def string }{
+		{"policy_id", "policy_id INTEGER"},
+		{"policy_revision", "policy_revision INTEGER"},
+	} {
+		exists, err := m.hasColumn("snapshots", col.name)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if _, err := m.db.Exec(`ALTER TABLE snapshots ADD COLUMN ` + col.def); err != nil {
+				return fmt.Errorf("add snapshots.%s: %w", col.name, err)
+			}
+		}
+	}
 	return nil
+}
+
+// hasColumn reports whether table has a column named col.
+func (m *Manifest) hasColumn(table, col string) (bool, error) {
+	rows, err := m.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // SnapshotInfo is the catalog view of one snapshot.
@@ -144,6 +187,10 @@ type SnapshotInfo struct {
 	CreatedAt   time.Time
 	CommittedAt *time.Time
 	Message     string
+	// PolicyID/PolicyRevision are nil for snapshots taken without a scan
+	// policy (full-tree scan, the historical behavior).
+	PolicyID       *int64
+	PolicyRevision *int
 }
 
 func scanSnapshot(row interface {
@@ -152,9 +199,10 @@ func scanSnapshot(row interface {
 	var s SnapshotInfo
 	var created, committed sql.NullString
 	var poly int64
+	var policyID, policyRev sql.NullInt64
 	if err := row.Scan(&s.ID, &s.RootPath, &s.Status, &poly, &s.FileCount,
 		&s.DirCount, &s.BytesTotal, &s.ChunksNew, &s.ChunksRef,
-		&created, &committed, &s.Message); err != nil {
+		&created, &committed, &s.Message, &policyID, &policyRev); err != nil {
 		return s, err
 	}
 	s.Polynomial = uint64(poly)
@@ -165,11 +213,19 @@ func scanSnapshot(row interface {
 			s.CommittedAt = &t
 		}
 	}
+	if policyID.Valid {
+		s.PolicyID = &policyID.Int64
+	}
+	if policyRev.Valid {
+		n := int(policyRev.Int64)
+		s.PolicyRevision = &n
+	}
 	return s, nil
 }
 
 const snapshotCols = `id, root_path, status, polynomial, file_count, dir_count,
-	bytes_total, chunks_new, chunks_ref, created_at, committed_at, message`
+	bytes_total, chunks_new, chunks_ref, created_at, committed_at, message,
+	policy_id, policy_revision`
 
 // ListSnapshots returns all snapshots, newest first.
 func (m *Manifest) ListSnapshots() ([]SnapshotInfo, error) {

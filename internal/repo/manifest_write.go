@@ -6,22 +6,50 @@ import (
 	"time"
 )
 
-// BeginSnapshot inserts a pending snapshot row.
-func (m *Manifest) BeginSnapshot(root string, polynomial uint64, message string) (int64, error) {
-	res, err := m.db.Exec(`INSERT INTO snapshots
-		(root_path, status, polynomial, created_at, message)
-		VALUES (?, ?, ?, ?, ?)`,
-		root, StatusPending, int64(polynomial), time.Now().UTC().Format(time.RFC3339Nano), message)
+// BeginSnapshot inserts a pending snapshot row. When frozen is non-nil the
+// policy reference and the full ordered rule set are frozen into
+// snapshot_policy_rules in the same transaction — before the walk starts —
+// so an interrupted or failed snapshot still carries the exact policy
+// version that defined its scope.
+func (m *Manifest) BeginSnapshot(root string, polynomial uint64, message string, frozen *FrozenPolicy) (int64, error) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var policyID, policyRev any
+	if frozen != nil {
+		policyID, policyRev = frozen.PolicyID, frozen.Revision
+	}
+	res, err := tx.Exec(`INSERT INTO snapshots
+		(root_path, status, polynomial, created_at, message, policy_id, policy_revision)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		root, StatusPending, int64(polynomial), nowUTC(), message, policyID, policyRev)
 	if err != nil {
 		return 0, fmt.Errorf("begin snapshot: %w", err)
 	}
-	return res.LastInsertId()
+	id, _ := res.LastInsertId()
+	if frozen != nil {
+		for i, r := range frozen.Rules {
+			seq := r.Seq
+			if seq == 0 {
+				seq = i + 1
+			}
+			if _, err := tx.Exec(`INSERT INTO snapshot_policy_rules
+				(snapshot_id, seq, action, pattern) VALUES (?, ?, ?, ?)`,
+				id, seq, r.Action, r.Pattern); err != nil {
+				return 0, fmt.Errorf("freeze policy rule %d: %w", seq, err)
+			}
+		}
+	}
+	return id, tx.Commit()
 }
 
-// SaveSnapshotContents writes all scanned entries, their chunk references and
-// chunk rows in one transaction. Missing-chunk failpoints call this with a
-// chunk row deliberately absent, which later verification must detect.
-func (m *Manifest) SaveSnapshotContents(id int64, entries []Entry, newChunks, refChunks, bytes, files, dirs int64) error {
+// SaveSnapshotContents writes all scanned entries, their chunk references,
+// chunk rows and the policy selection evidence in one transaction. Missing-
+// chunk failpoints call this with a chunk row deliberately absent, which
+// later verification must detect.
+func (m *Manifest) SaveSnapshotContents(id int64, entries []Entry, evidence []SelectionRecord, newChunks, refChunks, bytes, files, dirs int64) error {
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
@@ -38,7 +66,7 @@ func (m *Manifest) SaveSnapshotContents(id int64, entries []Entry, newChunks, re
 		}
 		for _, c := range e.Chunks {
 			if _, err := tx.Exec(`INSERT OR IGNORE INTO chunks (digest, length, created_at)
-				VALUES (?,?,?)`, c.Digest, c.Length, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				VALUES (?,?,?)`, c.Digest, c.Length, nowUTC()); err != nil {
 				return fmt.Errorf("save chunk: %w", err)
 			}
 			if _, err := tx.Exec(`INSERT INTO entry_chunks
@@ -46,6 +74,18 @@ func (m *Manifest) SaveSnapshotContents(id int64, entries []Entry, newChunks, re
 				id, e.RelPath, c.Digest, c.Seq); err != nil {
 				return fmt.Errorf("link chunk: %w", err)
 			}
+		}
+	}
+	for _, ev := range evidence {
+		isDir := 0
+		if ev.IsDir {
+			isDir = 1
+		}
+		if _, err := tx.Exec(`INSERT INTO snapshot_selection
+			(snapshot_id, rel_path, decision, rule_seq, rule_action, rule_pattern, is_dir, created_at)
+			VALUES (?,?,?,?,?,?,?,?)`,
+			id, ev.RelPath, ev.Decision, ev.RuleSeq, ev.RuleAction, ev.RulePattern, isDir, nowUTC()); err != nil {
+			return fmt.Errorf("save selection evidence for %q: %w", ev.RelPath, err)
 		}
 	}
 	if _, err := tx.Exec(`UPDATE snapshots SET

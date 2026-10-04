@@ -101,7 +101,28 @@ func (e *ErrRejected) Error() string {
 // CreateSnapshot scans root, persists a pending manifest, verifies every
 // referenced chunk against the live store, and only then commits. Any failure
 // leaves a failed (or, on hard crash, pending) snapshot with detailed errors.
+// It performs a full scan — identical to a request without a policy.
 func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnapshotResult, error) {
+	return e.createSnapshot(root, message, finish, nil)
+}
+
+// PolicySelection chooses the published policy revision for a snapshot.
+// Revision 0 means the policy's latest published revision.
+type PolicySelection struct {
+	PolicyID int64
+	Revision int
+}
+
+// CreateSnapshotWithPolicy is CreateSnapshot scoped by a published policy
+// revision. The revision and its ordered rules are frozen onto the pending
+// snapshot row before the walk starts, so a concurrent publish/disable can
+// never change the scope of an in-progress scan, and an interrupted scan
+// still carries the exact rule set that defined it.
+func (e *Engine) CreateSnapshotWithPolicy(root, message string, finish bool, sel PolicySelection) (*CreateSnapshotResult, error) {
+	return e.createSnapshot(root, message, finish, &sel)
+}
+
+func (e *Engine) createSnapshot(root, message string, finish bool, sel *PolicySelection) (*CreateSnapshotResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -117,11 +138,47 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 		return nil, fmt.Errorf("snapshot root %q is not a directory", root)
 	}
 
-	id, err := e.Manifest.BeginSnapshot(root, uint64(e.Pol), message)
+	// Resolve the policy before creating any row: only published revisions
+	// may be referenced, and an unresolvable reference is a client error,
+	// not a scan failure.
+	var frozen *repo.FrozenPolicy
+	var compiled *CompiledPolicy
+	if sel != nil {
+		rev, err := e.Manifest.ResolvePublishedRevision(sel.PolicyID, sel.Revision)
+		if err != nil {
+			return nil, err
+		}
+		rules, err := e.Manifest.RulesOfRevision(rev.ID)
+		if err != nil {
+			return nil, err
+		}
+		frozen = &repo.FrozenPolicy{
+			PolicyID: rev.PolicyID,
+			Revision: rev.Revision,
+			Rules:    rules,
+		}
+	}
+
+	id, err := e.Manifest.BeginSnapshot(root, uint64(e.Pol), message, frozen)
 	if err != nil {
 		return nil, err
 	}
 	res := &CreateSnapshotResult{SnapshotID: id, Status: repo.StatusPending}
+
+	if frozen != nil {
+		// Defense in depth: publishing validates rules, but the frozen set is
+		// re-validated at scan start so an illegal rule can never produce a
+		// committed snapshot, however it got into the catalog.
+		compiled, err = e.compileFrozen(frozen)
+		if err != nil {
+			reasons := []string{err.Error()}
+			_ = e.Manifest.AddError(id, "policy", "", nil, err.Error())
+			_ = e.Manifest.MarkFailed(id)
+			res.Status = repo.StatusFailed
+			res.Errors, _ = e.Manifest.ListErrors(id)
+			return res, &ErrRejected{SnapshotID: id, Reasons: reasons}
+		}
+	}
 
 	scan, err := Scan(ScanOptions{
 		Root:        root,
@@ -130,6 +187,7 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 		RetryDelay:  50 * time.Millisecond,
 		SettleDelay: 25 * time.Millisecond,
 		Sink:        storeSink{e},
+		Policy:      compiled,
 	})
 	if err != nil {
 		return res, e.fail(id, "scan", "", nil, err)
@@ -147,7 +205,7 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 		return res, &ErrRejected{SnapshotID: id, Reasons: reasons}
 	}
 
-	if err := e.Manifest.SaveSnapshotContents(id, scan.Entries,
+	if err := e.Manifest.SaveSnapshotContents(id, scan.Entries, toSelectionRecords(scan.Evidence),
 		scan.NewCount, scan.RefCount, scan.Bytes, scan.Files, scan.Dirs); err != nil {
 		return res, e.fail(id, "commit", "", nil, err)
 	}
@@ -164,6 +222,103 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 	}
 
 	return e.verifyAndFinalize(id)
+}
+
+// compileFrozen converts frozen repo rules into a validated matcher.
+func (e *Engine) compileFrozen(fp *repo.FrozenPolicy) (*CompiledPolicy, error) {
+	rules := make([]PolicyRule, 0, len(fp.Rules))
+	for _, r := range fp.Rules {
+		rules = append(rules, PolicyRule{Seq: r.Seq, Action: r.Action, Pattern: r.Pattern})
+	}
+	cp, err := CompilePolicy(rules)
+	if err != nil {
+		return nil, fmt.Errorf("frozen policy %d revision %d is invalid: %w",
+			fp.PolicyID, fp.Revision, err)
+	}
+	return cp, nil
+}
+
+// toSelectionRecords converts scan evidence into manifest rows.
+func toSelectionRecords(ev []SelectionEvidence) []repo.SelectionRecord {
+	out := make([]repo.SelectionRecord, 0, len(ev))
+	for _, e := range ev {
+		out = append(out, repo.SelectionRecord{
+			RelPath:     e.RelPath,
+			Decision:    e.Decision,
+			RuleSeq:     e.RuleSeq,
+			RuleAction:  e.RuleAction,
+			RulePattern: e.RulePattern,
+			IsDir:       e.IsDir,
+		})
+	}
+	return out
+}
+
+// PreviewResult is the dry-run outcome of a policy against a live tree.
+type PreviewResult struct {
+	Root      string
+	Files     int64
+	Dirs      int64
+	Symlinks  int64
+	Bytes     int64
+	Included  []string
+	Truncated bool
+	Evidence  []SelectionEvidence
+	Errors    []ScanError
+}
+
+// PreviewLimit caps how many included paths a preview lists.
+const PreviewLimit = 500
+
+// PreviewPolicy walks root under rules without reading file contents or
+// writing anything: it reports what a snapshot with this policy would
+// include, plus the full exclusion/exception evidence.
+func (e *Engine) PreviewPolicy(root string, rules []PolicyRule) (*PreviewResult, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, fmt.Errorf("preview root: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("preview root %q is not a directory", root)
+	}
+	compiled, err := CompilePolicy(rules)
+	if err != nil {
+		return nil, err
+	}
+	scan, err := Scan(ScanOptions{
+		Root:   root,
+		Policy: compiled,
+		DryRun: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res := &PreviewResult{
+		Root:     root,
+		Files:    scan.Files,
+		Dirs:     scan.Dirs,
+		Bytes:    scan.Bytes,
+		Evidence: scan.Evidence,
+		Errors:   scan.Errors,
+	}
+	for _, en := range scan.Entries {
+		if en.Kind == repo.KindSymlink {
+			res.Symlinks++
+		}
+		if en.RelPath == "." {
+			continue
+		}
+		if len(res.Included) < PreviewLimit {
+			res.Included = append(res.Included, en.RelPath)
+		} else {
+			res.Truncated = true
+		}
+	}
+	return res, nil
 }
 
 // injectChunkLoss implements the lose-chunks failpoint.

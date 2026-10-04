@@ -8,7 +8,14 @@
 //  5. commit interruption losing a blob -> failed snapshot with the exact
 //     missing chunk located,
 //  6. symlink escaping the root -> restored link is blocked,
-//  7. server restart with a pending snapshot -> startup recovery commits it.
+//  7. server restart with a pending snapshot -> startup recovery commits it,
+//  8. versioned scan policy: exclude *.tmp with an exception, evidence and
+//     rule-conformant restore,
+//  9. illegal rules (out-of-bounds / root-conflicting) rejected, no
+//     committed snapshot comes from them,
+//  10. policy copied and modified: old snapshot keeps old evidence,
+//     concurrent publish accepts one revision, interrupted scan keeps the
+//     frozen policy.
 package main
 
 import (
@@ -273,6 +280,225 @@ func main() {
 	si = get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", pendID))
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
+
+	// ---- 8. versioned scan policy: exclude + exception ---------------------
+	section(8, "版本化扫描策略：排除 *.tmp、例外保留 keep.tmp，证据可查询、恢复树符合规则")
+	// the escaping symlink from section 6 must go first: it would break the
+	// policy restore below (restore refuses escaping links by design)
+	must(os.Remove(filepath.Join(src, "evil_link")))
+	must(os.MkdirAll(filepath.Join(src, "tmp"), 0o755))
+	must(os.WriteFile(filepath.Join(src, "tmp", "debug.tmp"), []byte("scratch\n"), 0o644))
+	must(os.WriteFile(filepath.Join(src, "tmp", "scratch.tmp"), []byte("scratch2\n"), 0o644))
+	must(os.WriteFile(filepath.Join(src, "tmp", "keep.tmp"), []byte("precious\n"), 0o644))
+
+	code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+		"name": "dev-tmp",
+		"rules": []map[string]any{
+			{"action": "exclude", "pattern": "*.tmp"},
+			{"action": "exception", "pattern": "keep.tmp"},
+		},
+		"publish": true,
+	})
+	check("创建策略并立即发布 -> 201", code == http.StatusCreated)
+	policyID := int64(body["policy"].(map[string]any)["id"].(float64))
+	revs := body["policy"].(map[string]any)["revisions"].([]any)
+	rev1 := revs[0].(map[string]any)
+	check("修订 1 状态为 published（草稿→发布流转）",
+		rev1["revision"].(float64) == 1 && rev1["status"] == "published")
+
+	// preview: dry-run, nothing persisted
+	code, body = raw("POST", srv.URL+"/v1/policies/preview",
+		map[string]any{"root": src, "policy_id": policyID})
+	check("预览返回 200", code == http.StatusOK)
+	prevEv := body["evidence"].([]any)
+	prevExcluded, prevException := 0, 0
+	for _, x := range prevEv {
+		m := x.(map[string]any)
+		switch m["decision"] {
+		case "excluded":
+			prevExcluded++
+		case "exception":
+			prevException++
+		}
+	}
+	fmt.Printf("  预览: 文件=%v 排除命中=%d 例外命中=%d\n", body["files"], prevExcluded, prevException)
+	check("预览证据同时列出排除与例外两类命中", prevExcluded >= 2 && prevException == 1)
+
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "with tmp policy", "policy_id": policyID})
+	check("按策略创建快照 -> 201 committed",
+		code == http.StatusCreated && body["status"] == "committed")
+	policySnapID := int64(body["snapshot_id"].(float64))
+	check("快照记录了冻结的策略修订 (policy_id+revision=1)",
+		int64(body["policy_id"].(float64)) == policyID && body["policy_revision"].(float64) == 1)
+
+	sel := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/selection", policySnapID))
+	selPolicy := sel["policy"].(map[string]any)
+	frozenRules := selPolicy["rules"].([]any)
+	check("选择证据带冻结规则（2 条，含顺序）", len(frozenRules) == 2 &&
+		frozenRules[0].(map[string]any)["pattern"] == "*.tmp" &&
+		frozenRules[1].(map[string]any)["pattern"] == "keep.tmp")
+	var sawDebugExcluded, sawScratchExcluded, sawKeepException bool
+	for _, x := range sel["selection"].([]any) {
+		m := x.(map[string]any)
+		fmt.Printf("    证据: %-18s %-9s 命中规则 #%v %s %s\n",
+			m["rel_path"], m["decision"], m["rule_seq"], m["rule_action"], m["rule_pattern"])
+		switch m["rel_path"] {
+		case "tmp/debug.tmp":
+			sawDebugExcluded = m["decision"] == "excluded" && m["rule_seq"].(float64) == 1
+		case "tmp/scratch.tmp":
+			sawScratchExcluded = m["decision"] == "excluded"
+		case "tmp/keep.tmp":
+			sawKeepException = m["decision"] == "exception" && m["rule_seq"].(float64) == 2
+		}
+	}
+	check("证据列出 *.tmp 排除命中（debug.tmp、scratch.tmp）", sawDebugExcluded && sawScratchExcluded)
+	check("证据列出例外命中（keep.tmp 因规则 2 被保留）", sawKeepException)
+
+	restorePolicy := filepath.Join(work, "restore-policy")
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", policySnapID),
+		map[string]any{"target": restorePolicy})
+	if code != http.StatusCreated {
+		must(fmt.Errorf("policy restore failed: HTTP %d %s", code, body["message"]))
+	}
+	_, err = os.Lstat(filepath.Join(restorePolicy, "tmp", "debug.tmp"))
+	check("恢复树不含被排除的 tmp/debug.tmp", os.IsNotExist(err))
+	_, err = os.Lstat(filepath.Join(restorePolicy, "tmp", "scratch.tmp"))
+	check("恢复树不含被排除的 tmp/scratch.tmp", os.IsNotExist(err))
+	kept, kerr := os.ReadFile(filepath.Join(restorePolicy, "tmp", "keep.tmp"))
+	check("例外保留的 tmp/keep.tmp 被恢复且内容一致", kerr == nil && string(kept) == "precious\n")
+	_, err = os.Lstat(filepath.Join(restorePolicy, "app.log"))
+	check("未命中规则的文件照常恢复", err == nil)
+
+	// ---- 9. illegal rules are rejected -------------------------------------
+	section(9, "非法规则：越界(..、绝对路径)与根目录冲突的规则被拒绝，且不产生 committed 快照")
+	snapsBefore := len(get(srv.URL + "/v1/snapshots")["snapshots"].([]any))
+	for _, tc := range []struct {
+		name, pattern, want string
+	}{
+		{"越界 ..", "../escape", ".."},
+		{"绝对路径", "/etc/passwd", "absolute"},
+		{"与根目录冲突 **", "**", "root"},
+		{"与根目录冲突 *", "*", "root"},
+	} {
+		code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+			"name":    "bad-" + tc.name,
+			"rules":   []map[string]any{{"action": "exclude", "pattern": tc.pattern}},
+			"publish": true,
+		})
+		msg := fmt.Sprintf("%v", body["details"])
+		fmt.Printf("  规则 %-14q -> HTTP %d %s\n", tc.pattern, code, msg)
+		check(fmt.Sprintf("非法规则 %q 被拒绝 (422) 且说明原因", tc.pattern),
+			code == http.StatusUnprocessableEntity && body["error"] == "invalid_rules" &&
+				strings.Contains(msg, tc.want))
+	}
+	// a valid-but-never-published policy cannot be used either
+	code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+		"name":  "draft-only",
+		"rules": []map[string]any{{"action": "exclude", "pattern": "*.log"}},
+	})
+	check("仅草稿的策略可以创建（不发布）", code == http.StatusCreated)
+	draftPolicyID := int64(body["policy"].(map[string]any)["id"].(float64))
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "policy_id": draftPolicyID})
+	fmt.Printf("  用未发布策略建快照 -> HTTP %d: %s\n", code, body["message"])
+	check("未发布修订被拒绝 (409)，不创建快照", code == http.StatusConflict &&
+		body["error"] == "policy_not_published")
+	snapsAfter := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
+	committed := 0
+	for _, x := range snapsAfter {
+		if x.(map[string]any)["status"] == "committed" {
+			committed++
+		}
+	}
+	check("非法/未发布策略没有产生任何新快照（更没有 committed）", len(snapsAfter) == snapsBefore && committed > 0)
+
+	// ---- 10. versioning: copy, concurrency, freeze --------------------------
+	section(10, "版本流转：复制修订、并发发布只接受一个、扫描中断保留冻结策略")
+	code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+		"name":    "logs",
+		"rules":   []map[string]any{{"action": "exclude", "pattern": "*.log"}},
+		"publish": true,
+	})
+	logsPolicy := int64(body["policy"].(map[string]any)["id"].(float64))
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "logs excluded", "policy_id": logsPolicy})
+	snapV1 := int64(body["snapshot_id"].(float64))
+	check("修订 1 的快照 committed", code == http.StatusCreated && body["status"] == "committed")
+	selV1 := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/selection", snapV1))
+	v1Excluded := 0
+	for _, x := range selV1["selection"].([]any) {
+		if x.(map[string]any)["decision"] == "excluded" {
+			v1Excluded++
+		}
+	}
+	check("修订 1 证据：*.log 被排除（app.log、growing.log）", v1Excluded == 2)
+
+	// copy the published revision, modify the draft, publish as revision 2
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions", logsPolicy), nil)
+	check("复制修订 -> 新草稿 revision=2 base=1", code == http.StatusCreated &&
+		body["revision"].(map[string]any)["revision"].(float64) == 2 &&
+		body["revision"].(map[string]any)["base_revision"].(float64) == 1 &&
+		body["revision"].(map[string]any)["status"] == "draft")
+	code, body = raw("PUT", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions/2/rules", logsPolicy),
+		map[string]any{"rules": []map[string]any{{"action": "exclude", "pattern": "*.none"}}})
+	check("草稿可编辑（改为排除 *.none）", code == http.StatusOK)
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions/2/publish", logsPolicy), nil)
+	check("草稿发布为修订 2", code == http.StatusOK && body["revision"].(map[string]any)["status"] == "published")
+
+	// published revisions are immutable
+	code, body = raw("PUT", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions/1/rules", logsPolicy),
+		map[string]any{"rules": []map[string]any{{"action": "exclude", "pattern": "*.tmp"}}})
+	check("已发布修订不可编辑 (409 revision_immutable)",
+		code == http.StatusConflict && body["error"] == "revision_immutable")
+
+	// snapshot with revision 2: logs are back
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "logs included again", "policy_id": logsPolicy})
+	snapV2 := int64(body["snapshot_id"].(float64))
+	check("修订 2 的快照 committed 且记录 revision=2",
+		code == http.StatusCreated && body["policy_revision"].(float64) == 2)
+	selV2 := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/selection", snapV2))
+	check("修订 2 不再排除任何文件（无证据行）", len(selV2["selection"].([]any)) == 0)
+
+	// the old snapshot keeps its old evidence, untouched by the new revision
+	selV1Again := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/selection", snapV1))
+	p1 := selV1Again["policy"].(map[string]any)
+	check("旧快照仍指向修订 1 且保留旧排除证据",
+		p1["revision"].(float64) == 1 && len(selV1Again["selection"].([]any)) == v1Excluded)
+
+	// two windows publish concurrently: exactly one revision is accepted
+	code, _ = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions", logsPolicy), nil)
+	check("复制草稿 A (rev 3)", code == http.StatusCreated)
+	code, _ = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions", logsPolicy), nil)
+	check("复制草稿 B (rev 4)", code == http.StatusCreated)
+	type pubResult struct{ code int }
+	results := make(chan int, 2)
+	for _, rev := range []int{3, 4} {
+		go func(rev int) {
+			c, _ := raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions/%d/publish", logsPolicy, rev), nil)
+			results <- c
+		}(rev)
+	}
+	c1, c2 := <-results, <-results
+	fmt.Printf("  并发发布 rev3/rev4 -> HTTP %d 与 %d\n", c1, c2)
+	check("并发发布只接受一个修订（一个 200，一个 409 publish_conflict）",
+		(c1 == http.StatusOK && c2 == http.StatusConflict) || (c1 == http.StatusConflict && c2 == http.StatusOK))
+
+	// interrupted scan keeps the frozen policy and locatable failure info
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "crash with policy", "policy_id": logsPolicy, "finish": false})
+	crashPolicySnap := int64(body["snapshot_id"].(float64))
+	check("finish=false 留下 pending 快照", code == http.StatusCreated && body["status"] == "pending")
+	selCrash := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/selection", crashPolicySnap))
+	pc := selCrash["policy"].(map[string]any)
+	check("中断的快照仍保留冻结的策略与规则顺序",
+		pc["revision"] != nil && len(pc["rules"].([]any)) == 1)
+	code, body = raw("POST", srv.URL+"/v1/recover", nil)
+	check("恢复把 pending 快照复验为 committed", code == http.StatusOK)
+	si = get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", crashPolicySnap))
+	check("中断快照最终 committed，冻结策略未变", si["status"] == "committed" &&
+		si["policy_revision"] == pc["revision"])
 
 	// final listing
 	section(0, "快照总览")

@@ -30,7 +30,16 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("POST /v1/snapshots/{id}/verify", s.verify)
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
+	mux.HandleFunc("GET /v1/snapshots/{id}/selection", s.selectionEvidence)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("POST /v1/policies", s.createPolicy)
+	mux.HandleFunc("GET /v1/policies", s.listPolicies)
+	mux.HandleFunc("POST /v1/policies/preview", s.previewPolicy)
+	mux.HandleFunc("GET /v1/policies/{id}", s.getPolicy)
+	mux.HandleFunc("POST /v1/policies/{id}/revisions", s.copyRevision)
+	mux.HandleFunc("PUT /v1/policies/{id}/revisions/{rev}/rules", s.replaceRules)
+	mux.HandleFunc("POST /v1/policies/{id}/revisions/{rev}/publish", s.publishRevision)
+	mux.HandleFunc("POST /v1/policies/{id}/revisions/{rev}/disable", s.disableRevision)
 	return mux
 }
 
@@ -55,34 +64,38 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type snapshotResp struct {
-	ID          int64      `json:"id"`
-	RootPath    string     `json:"root_path"`
-	Status      string     `json:"status"`
-	FileCount   int64      `json:"file_count"`
-	DirCount    int64      `json:"dir_count"`
-	BytesTotal  int64      `json:"bytes_total"`
-	ChunksNew   int64      `json:"chunks_new"`
-	ChunksRef   int64      `json:"chunks_referenced"`
-	Polynomial  string     `json:"polynomial"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CommittedAt *time.Time `json:"committed_at,omitempty"`
-	Message     string     `json:"message"`
+	ID             int64      `json:"id"`
+	RootPath       string     `json:"root_path"`
+	Status         string     `json:"status"`
+	FileCount      int64      `json:"file_count"`
+	DirCount       int64      `json:"dir_count"`
+	BytesTotal     int64      `json:"bytes_total"`
+	ChunksNew      int64      `json:"chunks_new"`
+	ChunksRef      int64      `json:"chunks_referenced"`
+	Polynomial     string     `json:"polynomial"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CommittedAt    *time.Time `json:"committed_at,omitempty"`
+	Message        string     `json:"message"`
+	PolicyID       *int64     `json:"policy_id,omitempty"`
+	PolicyRevision *int       `json:"policy_revision,omitempty"`
 }
 
 func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
 	return snapshotResp{
-		ID:          si.ID,
-		RootPath:    si.RootPath,
-		Status:      si.Status,
-		FileCount:   si.FileCount,
-		DirCount:    si.DirCount,
-		BytesTotal:  si.BytesTotal,
-		ChunksNew:   si.ChunksNew,
-		ChunksRef:   si.ChunksRef,
-		Polynomial:  "0x" + strconv.FormatUint(si.Polynomial, 16),
-		CreatedAt:   si.CreatedAt,
-		CommittedAt: si.CommittedAt,
-		Message:     si.Message,
+		ID:             si.ID,
+		RootPath:       si.RootPath,
+		Status:         si.Status,
+		FileCount:      si.FileCount,
+		DirCount:       si.DirCount,
+		BytesTotal:     si.BytesTotal,
+		ChunksNew:      si.ChunksNew,
+		ChunksRef:      si.ChunksRef,
+		Polynomial:     "0x" + strconv.FormatUint(si.Polynomial, 16),
+		CreatedAt:      si.CreatedAt,
+		CommittedAt:    si.CommittedAt,
+		Message:        si.Message,
+		PolicyID:       si.PolicyID,
+		PolicyRevision: si.PolicyRevision,
 	}
 }
 
@@ -100,11 +113,13 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 }
 
 type createReq struct {
-	Root          string `json:"root"`
-	Message       string `json:"message"`
-	Finish        *bool  `json:"finish"`      // default true; false = die before commit (demo)
-	LoseChunks    int    `json:"lose_chunks"` // failpoint: delete N blobs pre-verify
-	UnstableRetry int    `json:"-"`
+	Root           string `json:"root"`
+	Message        string `json:"message"`
+	Finish         *bool  `json:"finish"`      // default true; false = die before commit (demo)
+	LoseChunks     int    `json:"lose_chunks"` // failpoint: delete N blobs pre-verify
+	PolicyID       *int64 `json:"policy_id"`   // optional: scan under a published policy revision
+	PolicyRevision int    `json:"policy_revision"`
+	UnstableRetry  int    `json:"-"`
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +141,17 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	s.Engine.Fail.LoseChunkCount = req.LoseChunks
 	defer func() { s.Engine.Fail.LoseChunkCount = 0 }()
 
-	res, err := s.Engine.CreateSnapshot(req.Root, req.Message, finish)
+	var res *backup.CreateSnapshotResult
+	var err error
+	if req.PolicyID != nil {
+		// Policy-scoped scan: the published revision is resolved and frozen
+		// before the walk starts.
+		res, err = s.Engine.CreateSnapshotWithPolicy(req.Root, req.Message, finish,
+			backup.PolicySelection{PolicyID: *req.PolicyID, Revision: req.PolicyRevision})
+	} else {
+		// No policy: full-tree scan, unchanged historical behavior.
+		res, err = s.Engine.CreateSnapshot(req.Root, req.Message, finish)
+	}
 	if err != nil {
 		var rej *backup.ErrRejected
 		if errors.As(err, &rej) {
@@ -137,6 +162,11 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 				"reasons":     rej.Reasons,
 				"hint":        "GET /v1/snapshots/" + strconv.FormatInt(rej.SnapshotID, 10) + "/missing",
 			})
+			return
+		}
+		if errors.Is(err, repo.ErrRevisionNotPublished) || errors.Is(err, repo.ErrPolicyNotFound) {
+			// No snapshot row was created: the reference itself is invalid.
+			writeErr(w, http.StatusConflict, "policy_not_published", err.Error(), nil)
 			return
 		}
 		status := http.StatusInternalServerError
@@ -151,12 +181,19 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	out := map[string]any{
 		"snapshot_id":       res.SnapshotID,
 		"status":            res.Status,
 		"chunks_new":        res.NewChunks,
 		"chunks_referenced": res.RefChunks,
-	})
+	}
+	if req.PolicyID != nil {
+		if si, gerr := s.Engine.Manifest.GetSnapshot(res.SnapshotID); gerr == nil {
+			out["policy_id"] = si.PolicyID
+			out["policy_revision"] = si.PolicyRevision
+		}
+	}
+	writeJSON(w, http.StatusCreated, out)
 }
 
 func parseID(w http.ResponseWriter, r *http.Request) (int64, bool) {

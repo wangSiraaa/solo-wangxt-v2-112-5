@@ -39,6 +39,12 @@ type ScanOptions struct {
 	// if anything changed during the settle window the file is re-read.
 	SettleDelay time.Duration
 	Sink        ChunkSink
+	// Policy, when non-nil, selects which paths enter the snapshot. nil keeps
+	// the historical behavior: every visited path is recorded.
+	Policy *CompiledPolicy
+	// DryRun collects metadata and policy evidence without reading or
+	// chunking any file content (policy preview).
+	DryRun bool
 }
 
 // ChunkSink receives chunks as files are read. Put stores data under digest
@@ -61,6 +67,7 @@ type ScanResult struct {
 	Entries  []repo.Entry
 	Errors   []ScanError
 	Chunks   map[string]repo.ChunkRef // digest(hex) -> ref, dedup across files
+	Evidence []SelectionEvidence      // policy decisions, empty without a policy
 	NewCount int64                    // distinct chunks newly written
 	RefCount int64                    // distinct chunks referenced
 	Bytes    int64
@@ -100,9 +107,31 @@ func Scan(opts ScanOptions) (*ScanResult, error) {
 			return nil
 		}
 		rel := relPath(opts.Root, path)
+		// Policy gate: purely lexical decision on the relative path. The root
+		// itself (".") is never filtered. Excluded directories are pruned;
+		// symlinks are matched by their own path, never resolved.
+		if opts.Policy != nil && rel != "." {
+			included, ev := opts.Policy.Decide(rel, info.IsDir())
+			if ev != nil {
+				res.Evidence = append(res.Evidence, *ev)
+			}
+			if !included {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
 		switch {
 		case info.Mode().IsRegular():
 			res.Files++
+			if opts.DryRun {
+				// Preview: metadata only, no content reads.
+				e := metaEntry(rel, repo.KindFile, info, "")
+				res.Entries = append(res.Entries, e)
+				res.Bytes += e.Size
+				return nil
+			}
 			e, errs := readStable(opts, path, rel, info, res)
 			if len(errs) > 0 {
 				res.Errors = append(res.Errors, errs...)
