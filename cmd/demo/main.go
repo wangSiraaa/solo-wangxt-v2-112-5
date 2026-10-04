@@ -24,7 +24,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"incbackup/internal/api"
@@ -274,6 +276,162 @@ func main() {
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
 
+	// ---- 8. versioned scan policy: excludes, exceptions, frozen evidence ----
+	section(8, "版本化扫描策略：草稿→发布→停用，排除 *.tmp 但例外保留，证据可查且冻结")
+	polSrc := filepath.Join(work, "src-pol")
+	must(os.MkdirAll(filepath.Join(polSrc, "cache"), 0o755))
+	must(os.WriteFile(filepath.Join(polSrc, "a.tmp"), []byte("temp A"), 0o644))
+	must(os.WriteFile(filepath.Join(polSrc, "b.tmp"), []byte("temp B"), 0o644))
+	must(os.WriteFile(filepath.Join(polSrc, "keep.tmp"), []byte("must survive"), 0o644))
+	must(os.WriteFile(filepath.Join(polSrc, "notes.txt"), []byte("real notes\n"), 0o644))
+	must(os.WriteFile(filepath.Join(polSrc, "cache", "c.tmp"), []byte("temp C"), 0o644))
+
+	// illegal escape rule rejected at creation
+	code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+		"name":  "evil",
+		"rules": []map[string]string{{"action": "exclude", "pattern": "../outside"}},
+	})
+	check("含 '..' 越界规则在创建时被拒绝（400），不产生任何修订", code == http.StatusBadRequest && body["error"] == "invalid_rules")
+
+	// draft
+	code, body = raw("POST", srv.URL+"/v1/policies", map[string]any{
+		"name":        "no-tmp",
+		"description": "drop regenerable temp files",
+		"rules": []map[string]string{
+			{"action": "exclude", "pattern": "*.tmp"},
+			{"action": "exception", "pattern": "keep.tmp"},
+		},
+	})
+	check("创建策略与首个草稿修订", code == http.StatusCreated)
+	polID := int64(body["policy_id"].(float64))
+	draftRev := body["revision"].(map[string]any)
+	revID := int64(draftRev["id"].(float64))
+
+	// snapshot referencing a draft is refused
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": polSrc, "policy_revision_id": revID})
+	check("快照只能引用已发布修订：草稿被拒 (422)，且不创建 committed 快照",
+		code == http.StatusUnprocessableEntity && body["error"] == "invalid_policy")
+
+	// preview first, then publish
+	code, body = raw("POST", srv.URL+"/v1/policies/preview", map[string]any{
+		"root": polSrc,
+		"rules": []map[string]string{
+			{"action": "exclude", "pattern": "*.tmp"},
+			{"action": "exception", "pattern": "keep.tmp"},
+		},
+	})
+	check("发布前预览：只做词法判定不落盘", code == http.StatusOK &&
+		body["excluded"].(float64) == 3 && body["included"].(float64) == 3)
+
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/revisions/%d/publish", revID), nil)
+	check("发布修订 1", code == http.StatusOK && body["status"] == "published")
+
+	// editing a published revision is refused; must copy
+	code, body = raw("PUT", srv.URL+fmt.Sprintf("/v1/revisions/%d", revID), map[string]any{
+		"rules": []map[string]string{{"action": "exclude", "pattern": "*.log"}},
+	})
+	check("已发布修订不可编辑 (409)，新修改必须复制版本",
+		code == http.StatusConflict && body["error"] == "revision_immutable")
+
+	// snapshot under published revision
+	code, body = raw("POST", srv.URL+"/v1/snapshots", map[string]any{
+		"root": polSrc, "message": "scoped v1", "policy_revision_id": revID,
+	})
+	check("按已发布修订创建快照成功 committed", code == http.StatusCreated && body["status"] == "committed")
+	polSnapID := int64(body["snapshot_id"].(float64))
+	check("快照响应记录所冻结的修订", body["policy_revision_id"].(float64) == float64(revID))
+
+	// selection evidence: both exclude and exception hits listed
+	code, body = raw("GET", srv.URL+fmt.Sprintf("/v1/snapshots/%d/selection", polSnapID), nil)
+	fz := body["frozen_revision"].(map[string]any)
+	check("证据中持久化修订号、规则顺序（2 条规则）", code == http.StatusOK &&
+		fz["revision_number"].(float64) == 1 && len(fz["rules"].([]any)) == 2)
+	var excPaths, keptPaths []string
+	for _, x := range body["selection"].([]any) {
+		m := x.(map[string]any)
+		hits := m["hits"].([]any)
+		if m["included"].(bool) {
+			keptPaths = append(keptPaths, m["rel_path"].(string))
+		} else {
+			excPaths = append(excPaths, m["rel_path"].(string))
+			check(fmt.Sprintf("  排除证据 %s 命中决定性 exclude *.tmp", m["rel_path"]),
+				len(hits) == 1 && hits[0].(map[string]any)["decisive"].(bool) &&
+					hits[0].(map[string]any)["action"] == "exclude")
+		}
+	}
+	sortStrings(excPaths)
+	check("排除证据列出所有 *.tmp（含 cache/c.tmp）", strings.Join(excPaths, ",") == "a.tmp,b.tmp,cache/c.tmp")
+	check("例外证据保留 keep.tmp，且同时列出 exclude+exception 两条命中",
+		len(keptPaths) == 1 && keptPaths[0] == "keep.tmp")
+
+	// restore tree obeys the rules
+	polRestore := filepath.Join(work, "restore-pol")
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", polSnapID),
+		map[string]any{"target": polRestore})
+	check("按策略快照恢复成功", code == http.StatusCreated)
+	_, errA := os.ReadFile(filepath.Join(polRestore, "keep.tmp"))
+	_, errN := os.ReadFile(filepath.Join(polRestore, "notes.txt"))
+	_, errX := os.Lstat(filepath.Join(polRestore, "a.tmp"))
+	check("恢复树：keep.tmp/notes.txt 在，a.tmp 不在",
+		errA == nil && errN == nil && os.IsNotExist(errX))
+
+	// copy -> modify -> publish revision 2 (also exclude the cache/ directory)
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions", polID),
+		map[string]any{"source_revision_id": revID, "comment": "also drop cache"})
+	rev2ID := int64(body["revision"].(map[string]any)["id"].(float64))
+	check("复制已发布修订为新草稿（号=2）", code == http.StatusCreated && body["number"].(float64) == 2)
+	code, body = raw("PUT", srv.URL+fmt.Sprintf("/v1/revisions/%d", rev2ID), map[string]any{
+		"rules": []map[string]string{
+			{"action": "exclude", "pattern": "*.tmp"},
+			{"action": "exception", "pattern": "keep.tmp"},
+			{"action": "exclude", "pattern": "cache/"},
+		},
+	})
+	check("在副本上修改草稿", code == http.StatusOK)
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/revisions/%d/publish", rev2ID), nil)
+	check("发布修订 2（旧修订保持不动）", code == http.StatusOK)
+
+	// old snapshot still carries revision 1 evidence
+	code, body = raw("GET", srv.URL+fmt.Sprintf("/v1/snapshots/%d/selection", polSnapID), nil)
+	check("旧快照仍冻结修订 1 的旧选择证据（2 条规则，不含 cache/）",
+		body["frozen_revision"].(map[string]any)["revision_number"].(float64) == 1 &&
+			len(body["frozen_revision"].(map[string]any)["rules"].([]any)) == 2)
+
+	// two windows concurrently publish the SAME new draft: exactly one wins
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/revisions", polID),
+		map[string]any{"source_revision_id": rev2ID, "comment": "race draft"})
+	raceRev := int64(body["revision"].(map[string]any)["id"].(float64))
+	raceCodes := make(chan int, 2)
+	var rwg sync.WaitGroup
+	rwg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer rwg.Done()
+			c, _ := raw("POST", srv.URL+fmt.Sprintf("/v1/revisions/%d/publish", raceRev), nil)
+			raceCodes <- c
+		}()
+	}
+	rwg.Wait()
+	close(raceCodes)
+	var raceWins [2]int
+	raceWins[0] = <-raceCodes
+	raceWins[1] = <-raceCodes
+	pc1, pc2 := raceWins[0], raceWins[1]
+	check("两个窗口并发发布同一草稿：恰好一个 200，另一个 409",
+		(pc1 == http.StatusOK && pc2 == http.StatusConflict) ||
+			(pc1 == http.StatusConflict && pc2 == http.StatusOK))
+
+	// retire: no new snapshots, old one still restorable
+	code, _ = raw("POST", srv.URL+fmt.Sprintf("/v1/policies/%d/retire", polID), nil)
+	check("停用策略", code == http.StatusOK)
+	code, body = raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": polSrc, "policy_revision_id": rev2ID})
+	check("停用后不能再按该策略建快照 (422)", code == http.StatusUnprocessableEntity)
+	code, _ = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", polSnapID),
+		map[string]any{"target": filepath.Join(work, "restore-pol-after-retire")})
+	check("停用不影响旧快照：仍可从冻结副本恢复", code == http.StatusCreated)
+
 	// final listing
 	section(0, "快照总览")
 	list := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
@@ -375,6 +533,8 @@ func section(n int, title string) {
 	}
 	fmt.Printf("\n── %d. %s ──────────────────────────────\n", n, title)
 }
+
+func sortStrings(s []string) { sort.Strings(s) }
 
 func check(name string, ok bool) {
 	if ok {

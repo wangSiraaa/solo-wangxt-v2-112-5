@@ -123,27 +123,55 @@ CREATE TABLE IF NOT EXISTS meta (
 `
 
 func (m *Manifest) migrate() error {
-	_, err := m.db.Exec(schemaSQL)
-	if err != nil {
+	if _, err := m.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("migrate manifest: %w", err)
 	}
+	if _, err := m.db.Exec(policySchemaSQL); err != nil {
+		return fmt.Errorf("migrate policy schema: %w", err)
+	}
+	// Additive migration for repositories created before excluded_by existed.
+	m.ensureColumn("snapshot_selection", "excluded_by", "TEXT NOT NULL DEFAULT ''")
 	return nil
+}
+
+// ensureColumn adds a column when it is absent from an existing table. SQLite
+// cannot ADD COLUMN IF NOT EXISTS, so pragma table_info is consulted.
+func (m *Manifest) ensureColumn(table, column, ddl string) {
+	rows, err := m.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return
+		}
+		if name == column {
+			return
+		}
+	}
+	_, _ = m.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl))
 }
 
 // SnapshotInfo is the catalog view of one snapshot.
 type SnapshotInfo struct {
-	ID          int64
-	RootPath    string
-	Status      string
-	Polynomial  uint64
-	FileCount   int64
-	DirCount    int64
-	BytesTotal  int64
-	ChunksNew   int64
-	ChunksRef   int64
-	CreatedAt   time.Time
-	CommittedAt *time.Time
-	Message     string
+	ID             int64
+	RootPath       string
+	Status         string
+	Polynomial     uint64
+	FileCount      int64
+	DirCount       int64
+	BytesTotal     int64
+	ChunksNew      int64
+	ChunksRef      int64
+	CreatedAt      time.Time
+	CommittedAt    *time.Time
+	Message        string
+	PolicyRevision int64 // 0 = legacy full scan
 }
 
 func scanSnapshot(row interface {
@@ -154,7 +182,7 @@ func scanSnapshot(row interface {
 	var poly int64
 	if err := row.Scan(&s.ID, &s.RootPath, &s.Status, &poly, &s.FileCount,
 		&s.DirCount, &s.BytesTotal, &s.ChunksNew, &s.ChunksRef,
-		&created, &committed, &s.Message); err != nil {
+		&created, &committed, &s.Message, &s.PolicyRevision); err != nil {
 		return s, err
 	}
 	s.Polynomial = uint64(poly)
@@ -168,12 +196,13 @@ func scanSnapshot(row interface {
 	return s, nil
 }
 
-const snapshotCols = `id, root_path, status, polynomial, file_count, dir_count,
-	bytes_total, chunks_new, chunks_ref, created_at, committed_at, message`
+const snapshotCols = `s.id, s.root_path, s.status, s.polynomial, s.file_count, s.dir_count,
+	s.bytes_total, s.chunks_new, s.chunks_ref, s.created_at, s.committed_at, s.message,
+	COALESCE((SELECT f.revision_id FROM snapshot_policy_freeze f WHERE f.snapshot_id = s.id), 0)`
 
 // ListSnapshots returns all snapshots, newest first.
 func (m *Manifest) ListSnapshots() ([]SnapshotInfo, error) {
-	rows, err := m.db.Query(`SELECT ` + snapshotCols + ` FROM snapshots ORDER BY id DESC`)
+	rows, err := m.db.Query(`SELECT ` + snapshotCols + ` FROM snapshots s ORDER BY s.id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +220,7 @@ func (m *Manifest) ListSnapshots() ([]SnapshotInfo, error) {
 
 // GetSnapshot fetches one snapshot.
 func (m *Manifest) GetSnapshot(id int64) (SnapshotInfo, error) {
-	row := m.db.QueryRow(`SELECT `+snapshotCols+` FROM snapshots WHERE id = ?`, id)
+	row := m.db.QueryRow(`SELECT `+snapshotCols+` FROM snapshots s WHERE s.id = ?`, id)
 	s, err := scanSnapshot(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return s, ErrNotFound

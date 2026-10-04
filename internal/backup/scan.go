@@ -14,6 +14,7 @@ import (
 
 	"github.com/restic/chunker"
 
+	"incbackup/internal/policy"
 	"incbackup/internal/repo"
 )
 
@@ -39,6 +40,10 @@ type ScanOptions struct {
 	// if anything changed during the settle window the file is re-read.
 	SettleDelay time.Duration
 	Sink        ChunkSink
+	// Selector, when non-nil, applies a frozen published policy revision. With
+	// no selector the scan behaves exactly as the full-scan default: every
+	// supported entry is backed up and no selection records are produced.
+	Selector *policy.Walker
 }
 
 // ChunkSink receives chunks as files are read. Put stores data under digest
@@ -66,6 +71,10 @@ type ScanResult struct {
 	Bytes    int64
 	Files    int64
 	Dirs     int64
+	// Selection carries per-path evidence when a Selector was supplied. It is
+	// populated even on a failing walk so the rejected snapshot still says
+	// which paths were excluded by which rules.
+	Selection []repo.SelectionRecord
 }
 
 // relPath converts an absolute walked path into a slash-separated path
@@ -100,6 +109,16 @@ func Scan(opts ScanOptions) (*ScanResult, error) {
 			return nil
 		}
 		rel := relPath(opts.Root, path)
+		if opts.Selector != nil && rel != "." {
+			if !applySelector(res, opts.Selector, rel, info) {
+				// Excluded by the frozen policy. The walk still descends (so
+				// every excluded descendant gets its own evidence row and
+				// exclusion never becomes a silent omission), but this entry
+				// is neither chunked nor added to the manifest. Symlinks are
+				// never followed by WalkDir.
+				return nil
+			}
+		}
 		switch {
 		case info.Mode().IsRegular():
 			res.Files++
@@ -137,6 +156,54 @@ func Scan(opts ScanOptions) (*ScanResult, error) {
 		res.RefCount++
 	}
 	return res, nil
+}
+
+// applySelector evaluates one walked path against the frozen revision. It
+// records evidence for every excluded path and for paths where several rules
+// matched (e.g. an exclude overridden by an exception); plain included paths
+// matched by at most one rule produce no row because they add no information.
+// Returns whether the entry belongs in the snapshot.
+func applySelector(res *ScanResult, sel *policy.Walker, rel string, info fs.FileInfo) bool {
+	d := sel.Visit(rel, info.IsDir())
+	record := !d.Included || len(d.Matches) > 1
+	if !record {
+		return d.Included
+	}
+	rec := repo.SelectionRecord{
+		RelPath:       rel,
+		KindHint:      kindHint(info),
+		Included:      d.Included,
+		FilterDefault: d.FilterDefault,
+		ExcludedBy:    d.ExcludedBy,
+	}
+	for _, mm := range d.Matches {
+		if mm.Decisive {
+			rec.DecisiveOrder = mm.Rule.Order
+			rec.DecisiveAction = string(mm.Rule.Action)
+			rec.DecisivePattern = mm.Rule.Pattern
+		}
+		rec.Hits = append(rec.Hits, repo.SelectionHit{
+			Order:    mm.Rule.Order,
+			Action:   string(mm.Rule.Action),
+			Pattern:  mm.Rule.Pattern,
+			Decisive: mm.Decisive,
+		})
+	}
+	res.Selection = append(res.Selection, rec)
+	return d.Included
+}
+
+func kindHint(info fs.FileInfo) string {
+	switch {
+	case info.Mode().IsRegular():
+		return repo.KindFile
+	case info.Mode()&fs.ModeSymlink != 0:
+		return repo.KindSymlink
+	case info.IsDir():
+		return repo.KindDir
+	default:
+		return "other"
+	}
 }
 
 func metaEntry(rel, kind string, info fs.FileInfo, target string) repo.Entry {

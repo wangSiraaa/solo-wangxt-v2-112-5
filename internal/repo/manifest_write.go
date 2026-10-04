@@ -89,8 +89,8 @@ func (m *Manifest) MarkFailed(id int64) error {
 // PendingSnapshots returns still-pending snapshots (e.g. process killed
 // between scan and commit).
 func (m *Manifest) PendingSnapshots() ([]SnapshotInfo, error) {
-	rows, err := m.db.Query(`SELECT `+snapshotCols+` FROM snapshots
-		WHERE status = ? ORDER BY id`, StatusPending)
+	rows, err := m.db.Query(`SELECT `+snapshotCols+` FROM snapshots s
+		WHERE s.status = ? ORDER BY s.id`, StatusPending)
 	if err != nil {
 		return nil, err
 	}

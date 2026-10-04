@@ -2,6 +2,7 @@ package backup
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/restic/chunker"
 
+	"incbackup/internal/policy"
 	"incbackup/internal/repo"
 )
 
@@ -68,6 +70,9 @@ type CreateSnapshotResult struct {
 	Errors     []repo.SnapshotError
 	NewChunks  int64
 	RefChunks  int64
+	// Freeze is set when the snapshot was created under a published policy
+	// revision; nil for the legacy full-scan path.
+	Freeze *repo.SnapshotFreeze
 }
 
 // storeSink adapts the content store to backup.ChunkSink and counts new blobs.
@@ -101,7 +106,31 @@ func (e *ErrRejected) Error() string {
 // CreateSnapshot scans root, persists a pending manifest, verifies every
 // referenced chunk against the live store, and only then commits. Any failure
 // leaves a failed (or, on hard crash, pending) snapshot with detailed errors.
+// It is the full-scan path: no policy means the entire tree is in scope.
 func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnapshotResult, error) {
+	return e.CreateSnapshotWithPolicy(root, message, finish, 0)
+}
+
+// ErrInvalidPolicy marks a request that referenced a draft/missing/retired
+// revision, or supplied a revision whose frozen rules no longer validate. No
+// snapshot row exists in that case: an invalid policy must never produce even
+// a failed "committed-looking" artifact.
+type ErrInvalidPolicy struct {
+	RevisionID int64
+	Reason     string
+	RuleErrors []string
+}
+
+func (e *ErrInvalidPolicy) Error() string {
+	return fmt.Sprintf("revision %d unusable: %s", e.RevisionID, e.Reason)
+}
+
+// CreateSnapshotWithPolicy is the policy-aware snapshot path. revisionID==0
+// means the legacy full scan (byte-identical behavior, no freeze row). A
+// positive revisionID must reference a published revision; it is frozen
+// atomically with the pending snapshot row before any scanning starts, so a
+// concurrent publish/retire cannot change this snapshot's scope.
+func (e *Engine) CreateSnapshotWithPolicy(root, message string, finish bool, revisionID int64) (*CreateSnapshotResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -117,12 +146,40 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 		return nil, fmt.Errorf("snapshot root %q is not a directory", root)
 	}
 
+	var freeze *repo.SnapshotFreeze
+	var walker *policy.Walker
+	if revisionID != 0 {
+		compiled, ierr := e.validatePublished(revisionID)
+		if ierr != nil {
+			return nil, ierr
+		}
+		walker = policy.NewWalker(compiled)
+		// Freeze atomically with the pending snapshot row, *before* scanning.
+		id, fz, ferr := e.Manifest.BeginSnapshotWithPolicy(root, uint64(e.Pol), message, revisionID)
+		if ferr != nil {
+			if errors.Is(ferr, repo.ErrNotPublished) || errors.Is(ferr, repo.ErrPolicyRetired) ||
+				errors.Is(ferr, repo.ErrRevisionNotFound) {
+				return nil, &ErrInvalidPolicy{RevisionID: revisionID, Reason: ferr.Error()}
+			}
+			return nil, ferr
+		}
+		freeze = fz
+		res := &CreateSnapshotResult{SnapshotID: id, Status: repo.StatusPending, Freeze: freeze}
+		return e.runScan(id, res, root, walker, finish)
+	}
+
 	id, err := e.Manifest.BeginSnapshot(root, uint64(e.Pol), message)
 	if err != nil {
 		return nil, err
 	}
 	res := &CreateSnapshotResult{SnapshotID: id, Status: repo.StatusPending}
+	return e.runScan(id, res, root, nil, finish)
+}
 
+// runScan performs the walk, persists selection evidence and finalizes the
+// pending snapshot created by the caller.
+func (e *Engine) runScan(id int64, res *CreateSnapshotResult, root string,
+	selector *policy.Walker, finish bool) (*CreateSnapshotResult, error) {
 	scan, err := Scan(ScanOptions{
 		Root:        root,
 		Params:      ChunkParams{e.Pol, DefaultMinSize, DefaultMaxSize, DefaultAverageBits},
@@ -130,10 +187,15 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 		RetryDelay:  50 * time.Millisecond,
 		SettleDelay: 25 * time.Millisecond,
 		Sink:        storeSink{e},
+		Selector:    selector,
 	})
 	if err != nil {
+		e.persistEvidence(id, scan)
 		return res, e.fail(id, "scan", "", nil, err)
 	}
+	// Persist selection evidence before evaluating the walk, so even a
+	// rejected/interrupted scan keeps "which rule excluded which path".
+	e.persistEvidence(id, scan)
 	if len(scan.Errors) > 0 {
 		var reasons []string
 		for _, se := range scan.Errors {
@@ -164,6 +226,47 @@ func (e *Engine) CreateSnapshot(root, message string, finish bool) (*CreateSnaps
 	}
 
 	return e.verifyAndFinalize(id)
+}
+
+// validatePublished confirms revisionID names a published revision whose
+// frozen rule document still compiles. No snapshot exists yet when this runs,
+// so rejection leaves nothing committed.
+func (e *Engine) validatePublished(revisionID int64) (*policy.Compiled, error) {
+	rev, err := e.Manifest.GetRevision(revisionID)
+	if err != nil {
+		return nil, &ErrInvalidPolicy{RevisionID: revisionID, Reason: err.Error()}
+	}
+	if rev.Status != repo.RevPublished {
+		return nil, &ErrInvalidPolicy{
+			RevisionID: revisionID,
+			Reason:     fmt.Sprintf("revision %d is %s; snapshots may only reference published revisions", revisionID, rev.Status),
+		}
+	}
+	var rules []policy.Rule
+	if err := json.Unmarshal(rev.RulesJSON, &rules); err != nil {
+		return nil, &ErrInvalidPolicy{RevisionID: revisionID, Reason: "frozen rules unreadable: " + err.Error()}
+	}
+	compiled, err := policy.Compile(rules)
+	if err != nil {
+		ip := &ErrInvalidPolicy{RevisionID: revisionID, Reason: "frozen rules no longer validate"}
+		var ve *policy.ValidationError
+		if errors.As(err, &ve) {
+			for _, re := range ve.Errors {
+				ip.RuleErrors = append(ip.RuleErrors, re.Error())
+			}
+		}
+		return nil, ip
+	}
+	return compiled, nil
+}
+
+func (e *Engine) persistEvidence(id int64, scan *ScanResult) {
+	if scan == nil || len(scan.Selection) == 0 {
+		return
+	}
+	if err := e.Manifest.SaveSelectionEvidence(id, scan.Selection); err != nil {
+		_ = e.Manifest.AddError(id, "commit", "", nil, "persist selection evidence: "+err.Error())
+	}
 }
 
 // injectChunkLoss implements the lose-chunks failpoint.
@@ -209,6 +312,9 @@ func (e *Engine) verifyAndFinalize(id int64) (*CreateSnapshotResult, error) {
 		return res, err
 	}
 	res.NewChunks, res.RefChunks = info.ChunksNew, info.ChunksRef
+	if fz, ferr := e.Manifest.GetFreeze(id); ferr == nil {
+		res.Freeze = fz
+	}
 
 	missing, err := e.Manifest.FindMissingChunks(id, func(digest []byte, length int64) (bool, error) {
 		return e.Store.Has(digest, length)

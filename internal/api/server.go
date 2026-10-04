@@ -31,6 +31,7 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	s.registerPolicyRoutes(mux)
 	return mux
 }
 
@@ -55,34 +56,36 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type snapshotResp struct {
-	ID          int64      `json:"id"`
-	RootPath    string     `json:"root_path"`
-	Status      string     `json:"status"`
-	FileCount   int64      `json:"file_count"`
-	DirCount    int64      `json:"dir_count"`
-	BytesTotal  int64      `json:"bytes_total"`
-	ChunksNew   int64      `json:"chunks_new"`
-	ChunksRef   int64      `json:"chunks_referenced"`
-	Polynomial  string     `json:"polynomial"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CommittedAt *time.Time `json:"committed_at,omitempty"`
-	Message     string     `json:"message"`
+	ID             int64      `json:"id"`
+	RootPath       string     `json:"root_path"`
+	Status         string     `json:"status"`
+	FileCount      int64      `json:"file_count"`
+	DirCount       int64      `json:"dir_count"`
+	BytesTotal     int64      `json:"bytes_total"`
+	ChunksNew      int64      `json:"chunks_new"`
+	ChunksRef      int64      `json:"chunks_referenced"`
+	Polynomial     string     `json:"polynomial"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CommittedAt    *time.Time `json:"committed_at,omitempty"`
+	Message        string     `json:"message"`
+	PolicyRevision int64      `json:"policy_revision_id,omitempty"`
 }
 
 func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
 	return snapshotResp{
-		ID:          si.ID,
-		RootPath:    si.RootPath,
-		Status:      si.Status,
-		FileCount:   si.FileCount,
-		DirCount:    si.DirCount,
-		BytesTotal:  si.BytesTotal,
-		ChunksNew:   si.ChunksNew,
-		ChunksRef:   si.ChunksRef,
-		Polynomial:  "0x" + strconv.FormatUint(si.Polynomial, 16),
-		CreatedAt:   si.CreatedAt,
-		CommittedAt: si.CommittedAt,
-		Message:     si.Message,
+		ID:             si.ID,
+		RootPath:       si.RootPath,
+		Status:         si.Status,
+		FileCount:      si.FileCount,
+		DirCount:       si.DirCount,
+		BytesTotal:     si.BytesTotal,
+		ChunksNew:      si.ChunksNew,
+		ChunksRef:      si.ChunksRef,
+		Polynomial:     "0x" + strconv.FormatUint(si.Polynomial, 16),
+		CreatedAt:      si.CreatedAt,
+		CommittedAt:    si.CommittedAt,
+		Message:        si.Message,
+		PolicyRevision: si.PolicyRevision,
 	}
 }
 
@@ -102,8 +105,9 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 type createReq struct {
 	Root          string `json:"root"`
 	Message       string `json:"message"`
-	Finish        *bool  `json:"finish"`      // default true; false = die before commit (demo)
-	LoseChunks    int    `json:"lose_chunks"` // failpoint: delete N blobs pre-verify
+	Finish        *bool  `json:"finish"`             // default true; false = die before commit (demo)
+	LoseChunks    int    `json:"lose_chunks"`        // failpoint: delete N blobs pre-verify
+	PolicyRev     int64  `json:"policy_revision_id"` // 0/absent = full scan (legacy)
 	UnstableRetry int    `json:"-"`
 }
 
@@ -126,8 +130,18 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	s.Engine.Fail.LoseChunkCount = req.LoseChunks
 	defer func() { s.Engine.Fail.LoseChunkCount = 0 }()
 
-	res, err := s.Engine.CreateSnapshot(req.Root, req.Message, finish)
+	res, err := s.Engine.CreateSnapshotWithPolicy(req.Root, req.Message, finish, req.PolicyRev)
 	if err != nil {
+		var badPol *backup.ErrInvalidPolicy
+		if errors.As(err, &badPol) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error":              "invalid_policy",
+				"policy_revision_id": badPol.RevisionID,
+				"message":            badPol.Error(),
+				"details":            badPol.RuleErrors,
+			})
+			return
+		}
 		var rej *backup.ErrRejected
 		if errors.As(err, &rej) {
 			writeJSON(w, http.StatusConflict, map[string]any{
@@ -152,11 +166,19 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"snapshot_id":       res.SnapshotID,
-		"status":            res.Status,
-		"chunks_new":        res.NewChunks,
-		"chunks_referenced": res.RefChunks,
+		"snapshot_id":        res.SnapshotID,
+		"status":             res.Status,
+		"chunks_new":         res.NewChunks,
+		"chunks_referenced":  res.RefChunks,
+		"policy_revision_id": freezeID(res),
 	})
+}
+
+func freezeID(res *backup.CreateSnapshotResult) int64 {
+	if res.Freeze != nil {
+		return res.Freeze.RevisionID
+	}
+	return 0
 }
 
 func parseID(w http.ResponseWriter, r *http.Request) (int64, bool) {
